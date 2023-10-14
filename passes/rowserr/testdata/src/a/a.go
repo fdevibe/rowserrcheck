@@ -98,3 +98,41 @@ func f10() {
 	}
 	resCloser(rows)
 }
+
+func standAloneCloser(rs *sql.Rows) {
+	_ = rs.Err()
+}
+
+func f11() {
+	rows, _ := db.Query("") // OK
+	defer standAloneCloser(rows)
+}
+
+func f12() {
+	rows, _ := db.Query("") // OK
+	defer func(rows *sql.Rows) {
+		standAloneCloser(rows)
+	}(rows)
+}
+
+func returningCloser(rs *sql.Rows) error {
+	return rs.Err()
+}
+
+func f13() (err error) {
+	rows, _ := db.Query("") // OK
+	defer func(rows *sql.Rows) {
+		returningCloser(rows)
+	}(rows)
+
+	return err
+}
+
+func f14() (err error) {
+	rows, _ := db.Query("") // OK
+	defer func(rows *sql.Rows) {
+		err = returningCloser(rows)
+	}(rows)
+
+	return err
+}

@@ -100,7 +100,7 @@ func (r runner) run(pass *analysis.Pass, pkgPath string) {
 
 		for _, b := range f.Blocks {
 			for i := range b.Instrs {
-				if r.errCallMissing(b, i) {
+				if r.errCallMissing(b.Instrs[i]) {
 					pass.Reportf(b.Instrs[i].Pos(), "rows.Err must be checked")
 				}
 			}
@@ -108,8 +108,91 @@ func (r runner) run(pass *analysis.Pass, pkgPath string) {
 	}
 }
 
-func (r *runner) errCallMissing(b *ssa.BasicBlock, i int) (ret bool) {
-	call, ok := r.getCallReturnsRow(b.Instrs[i])
+func (r *runner) errCalled(resRef ssa.Instruction) bool {
+	switch resRef := resRef.(type) {
+	case *ssa.Phi:
+		for _, rf := range *resRef.Referrers() {
+			if r.errCalled(rf) {
+				return true
+			}
+		}
+	case *ssa.Store: // Call in Closure function
+		for _, aref := range *resRef.Addr.Referrers() {
+			switch c := aref.(type) {
+			case *ssa.MakeClosure:
+				f := c.Fn.(*ssa.Function)
+				called := r.isClosureCalled(c)
+				if r.calledInFunc(f, called) {
+					return true
+				}
+			case *ssa.UnOp:
+				for _, rf := range *c.Referrers() {
+					if r.errCalled(rf) {
+						return true
+					}
+				}
+			}
+		}
+	case *ssa.Call: // Indirect function call
+		if r.isErrCall(resRef) {
+			return true
+		}
+		if r.errCalledInFunc(resRef.Call.Value, resRef.Parent().Name()) {
+			return true
+		}
+	case *ssa.FieldAddr:
+		for _, bRef := range *resRef.Referrers() {
+			bOp, ok := r.getBodyOp(bRef)
+			if !ok {
+				continue
+			}
+
+			for _, ccall := range *bOp.Referrers() {
+				if r.isErrCall(ccall) {
+					return true
+				}
+			}
+		}
+	case *ssa.Defer:
+		if r.isErrCall(resRef) {
+			return true
+		}
+		if r.errCalledInFunc(resRef.Call.Value, resRef.Parent().Name()) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (r *runner) errCalledInFunc(val ssa.Value, name string) bool {
+	var (
+		f  *ssa.Function
+		ok bool
+	)
+
+	if f, ok = val.(*ssa.Function); !ok {
+		var c *ssa.MakeClosure
+		if c, ok = val.(*ssa.MakeClosure); ok {
+			f, ok = c.Fn.(*ssa.Function)
+		}
+		if !ok {
+			return false
+		}
+	}
+
+	for _, b := range f.Blocks {
+		for i := range b.Instrs {
+			if !r.errCallMissing(b.Instrs[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (r *runner) errCallMissing(instr ssa.Instruction) (ret bool) {
+	call, ok := r.getCallReturnsRow(instr)
 	if !ok {
 		return false
 	}
@@ -123,65 +206,9 @@ func (r *runner) errCallMissing(b *ssa.BasicBlock, i int) (ret bool) {
 			continue
 		}
 		resRefs := *val.Referrers()
-		var errCalled func(resRef ssa.Instruction) bool
-		errCalled = func(resRef ssa.Instruction) bool {
-			switch resRef := resRef.(type) {
-			case *ssa.Phi:
-				for _, rf := range *resRef.Referrers() {
-					if errCalled(rf) {
-						return true
-					}
-				}
-			case *ssa.Store: // Call in Closure function
-				for _, aref := range *resRef.Addr.Referrers() {
-					switch c := aref.(type) {
-					case *ssa.MakeClosure:
-						f := c.Fn.(*ssa.Function)
-						called := r.isClosureCalled(c)
-						if r.calledInFunc(f, called) {
-							return true
-						}
-					case *ssa.UnOp:
-						for _, rf := range *c.Referrers() {
-							if errCalled(rf) {
-								return true
-							}
-						}
-					}
-				}
-			case *ssa.Call: // Indirect function call
-				if r.isErrCall(resRef) {
-					return true
-				}
-				if f, ok := resRef.Call.Value.(*ssa.Function); ok {
-					for _, b := range f.Blocks {
-						for i := range b.Instrs {
-							if !r.errCallMissing(b, i) {
-								return true
-							}
-						}
-					}
-				}
-			case *ssa.FieldAddr:
-				for _, bRef := range *resRef.Referrers() {
-					bOp, ok := r.getBodyOp(bRef)
-					if !ok {
-						continue
-					}
-
-					for _, ccall := range *bOp.Referrers() {
-						if r.isErrCall(ccall) {
-							return true
-						}
-					}
-				}
-			}
-
-			return false
-		}
 
 		for _, resRef := range resRefs {
-			if errCalled(resRef) {
+			if r.errCalled(resRef) {
 				return false
 			}
 		}
@@ -294,7 +321,7 @@ func (r *runner) calledInFunc(f *ssa.Function, called bool) bool {
 					}
 				}
 			default:
-				if r.errCallMissing(b, i) || !called {
+				if r.errCallMissing(b.Instrs[i]) || !called {
 					return false
 				}
 			}
